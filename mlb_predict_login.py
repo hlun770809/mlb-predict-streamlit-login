@@ -5,6 +5,7 @@ import sqlite3
 import os
 import requests
 
+
 st.write("這是 MLB_PREDICT Login 版 測試畫面 v4.4（點數紀錄+每日獎勵+補點）")
 
 DB_PATH = "mlb_predictions.db"
@@ -54,17 +55,18 @@ TEAM_NAME_ZH = {
 
 # ===================== MLB 明日賽程（statsapi） =====================
 
-def fetch_taiwan_tomorrow_schedule():
+def fetch_schedule_by_date_tw(target_date: date):
+    """
+    以「台灣時間的指定日期」為基準，向 statsapi 要該日所有 MLB 比賽。
+    target_date: datetime.date 物件（台灣日曆）。
+    """
     tz_tw = timezone(timedelta(hours=8))
-    now_tw = datetime.now(tz=tz_tw)
-    tomorrow_tw = (now_tw + timedelta(days=1)).date()
+    target_date_str = target_date.strftime("%Y-%m-%d")
 
-    start_date_us = now_tw.strftime("%Y-%m-%d")
-    end_date_us = (now_tw + timedelta(days=1)).strftime("%Y-%m-%d")
-
+    # 直接用 target_date 當 startDate / endDate
     url = (
         "https://statsapi.mlb.com/api/v1/schedule"
-        f"?sportId=1&startDate={start_date_us}&endDate={end_date_us}"
+        f"?sportId=1&startDate={target_date_str}&endDate={target_date_str}"
         "&language=en&hydrate=team&timeZone=America/New_York"
     )
     resp = requests.get(url, timeout=10)
@@ -77,11 +79,9 @@ def fetch_taiwan_tomorrow_schedule():
             away_team = game["teams"]["away"]["team"]["name"]
             home_team = game["teams"]["home"]["team"]["name"]
 
+            # 官方給的 gameDate 是 UTC，轉成台灣時間只做顯示
             game_dt_utc = datetime.fromisoformat(game["gameDate"].replace("Z", "+00:00"))
             game_dt_tw = game_dt_utc.astimezone(tz_tw)
-
-            if game_dt_tw.date() != tomorrow_tw:
-                continue
 
             venue = game.get("venue", {}).get("name", "")
 
@@ -90,7 +90,7 @@ def fetch_taiwan_tomorrow_schedule():
                     "game_id": str(game_pk),
                     "away_name": away_team,
                     "home_name": home_team,
-                    "game_date": tomorrow_tw.strftime("%Y-%m-%d"),
+                    "game_date": target_date_str,
                     "game_datetime": game_dt_tw.strftime("%Y-%m-%d %H:%M"),
                     "venue": venue,
                     "ml_away": 0,
@@ -101,9 +101,10 @@ def fetch_taiwan_tomorrow_schedule():
     return games_data
 
 @st.cache_data(ttl=300)
-def get_games():
+def get_games(target_date: date):
+    """抓指定台灣日期的 MLB 賽程"""
     try:
-        return fetch_taiwan_tomorrow_schedule()
+        return fetch_schedule_by_date_tw(target_date)
     except Exception as e:
         st.warning(f"抓取 MLB 賽程失敗：{e}")
         return []
@@ -211,6 +212,45 @@ def fetch_mlb_odds():
             "totals": totals,
         }
     return odds_map
+    
+def resync_games_table():
+    """
+    重新同步 games 表：
+    1. 清空既有 games。
+    2. 用 get_games() 抓一批賽程寫入 games。
+    不動 users / predictions。
+    """
+    conn = get_db()
+    c = conn.cursor()
+
+    # 清空舊 games 資料
+    c.execute("DELETE FROM games")
+    conn.commit()
+
+    # 用目前的 get_games() 抓賽程重建
+    games = get_games()
+    for g in games:
+        c.execute(
+            """
+            INSERT OR IGNORE INTO games
+            (game_id, away_team, home_team, game_date, game_datetime, venue, ml_away, ml_home, runline, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Scheduled')
+            """,
+            (
+                g["game_id"],
+                g["away_name"],
+                g["home_name"],
+                g["game_date"],
+                g["game_datetime"],
+                g["venue"],
+                g["ml_away"],
+                g["ml_home"],
+                g["runline"],
+            ),
+        )
+    conn.commit()
+    conn.close()
+
 
 # ===================== DB & helpers =====================
 
@@ -269,7 +309,7 @@ def init_db():
                 created_at TEXT
             )
         """)
-        games = get_games()
+        games = get_games(date.today() + timedelta(days=1))
         for g in games:
             c.execute(
                 """
@@ -755,7 +795,6 @@ def compute_season_score(player: str, days: int = 365):
                 score += 3
     return score
 
-
 # ===================== Streamlit UI =====================
 
 st.set_page_config(page_title="⚾ MLB 預測王 v4.4", layout="wide", page_icon="⚾")
@@ -864,8 +903,17 @@ odds_map = fetch_mlb_odds()
 # ===================== 明日賽程 =====================
 
 if active_page == "明日賽程":
-    st.header("📅 明日賽程（statsapi + 市場盤口）")
-    games = get_games()
+    st.header("📅 賽程查詢（statsapi + 市場盤口）")
+
+    # 預設日期：台灣的「明天」
+    tz_tw = timezone(timedelta(hours=8))
+    now_tw = datetime.now(tz=tz_tw)
+    default_date = (now_tw + timedelta(days=1)).date()
+
+    target_date = st.date_input("選擇要查看的日期（台灣日曆）", value=default_date)
+    st.caption(f"目前顯示日期：{target_date.strftime('%Y-%m-%d')}")
+
+    games = get_games(target_date)
     if not games:
         st.info("目前查不到『台灣明日』的 MLB 賽程（可能尚未排定）。")
     else:
