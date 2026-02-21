@@ -108,6 +108,39 @@ def get_games():
         st.warning(f"抓取 MLB 賽程失敗：{e}")
         return []
 
+# ========================================================
+
+def fetch_game_final_score_from_statsapi(game_id: str):
+    """
+    用 statsapi 抓單場比賽最終比分。
+
+    回傳:
+        (away_score, home_score, status_str)
+        若抓取失敗或比賽尚未結束，回傳 (None, None, status_str)
+    """
+    try:
+        url = f"https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        st.warning(f"statsapi 抓取比賽 {game_id} 失敗：{e}")
+        return None, None, "ERROR"
+
+    try:
+        status_str = data.get("gameData", {}).get("status", {}).get("detailedState", "")
+        linescore = data.get("liveData", {}).get("linescore", {})
+        teams = linescore.get("teams", {})
+        away = teams.get("away", {})
+        home = teams.get("home", {})
+        away_score = away.get("runs")
+        home_score = home.get("runs")
+    except Exception:
+        return None, None, status_str or "UNKNOWN"
+
+    return away_score, home_score, status_str
+
+
 # ===================== The Odds API =====================
 
 @st.cache_data(ttl=300)
@@ -400,6 +433,25 @@ def get_latest_points_log(username):
     if df.empty:
         return None
     return df.iloc[0]
+    
+def get_recent_points_logs_all(limit=100):
+    """取得全站最近 limit 筆點數異動紀錄"""
+    conn = get_db()
+    df = pd.read_sql_query(
+        """
+        SELECT username, delta, reason, created_at
+        FROM points_logs
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        conn,
+        params=(limit,),
+    )
+    conn.close()
+    if df.empty:
+        return []
+    return df.to_dict(orient="records")
+    
 
 def apply_daily_bonus_if_needed(username):
     """若今天尚未發每日加成，發一次性獎勵，回傳 bool 表示是否有發獎金。"""
@@ -582,6 +634,20 @@ def get_all_predictions_join():
     )
     conn.close()
     return df
+    
+def get_distinct_game_ids_in_predictions():
+    """從 predictions 取得目前有預測紀錄的 game_id 列表"""
+    conn = get_db()
+    df = pd.read_sql_query(
+        """
+        SELECT DISTINCT game_id
+        FROM predictions
+        WHERE game_id IS NOT NULL
+        """,
+        conn,
+    )
+    conn.close()
+    return df["game_id"].tolist()
 
 def is_user_blocked(username):
     conn = get_db()
@@ -604,6 +670,91 @@ def get_month_start_today():
     today = date.today()
     start = today.replace(day=1)
     return start.strftime("%Y-%m-%d")
+
+# ====predictions + 結算結果計算某玩家的徽章列表 ========
+
+def compute_player_badges(player: str):
+    """根據 predictions + 結算結果計算某玩家的徽章列表"""
+    conn = get_db()
+    df = pd.read_sql_query(
+        """
+        SELECT pick, is_correct, is_main, created_at
+        FROM predictions
+        WHERE player=?
+        ORDER BY created_at ASC
+        """,
+        conn,
+        params=(player,),
+    )
+    conn.close()
+
+    badges = []
+
+    if df.empty:
+        return badges
+
+    # 總場次、命中場次、主力命中
+    total_games = df["is_correct"].notnull().sum()
+    win_games = df[df["is_correct"] == 1].shape[0]
+    main_hits = df[(df["is_main"] == 1) & (df["is_correct"] == 1)].shape[0]
+    win_rate = (win_games / total_games) * 100 if total_games > 0 else 0.0
+
+    # 1) 新手起步：10 場已結算
+    if total_games >= 10:
+        badges.append("新手起步")
+
+    # 2) 穩定射手：50 場以上且勝率 >= 55%
+    if total_games >= 50 and win_rate >= 55:
+        badges.append("穩定射手")
+
+    # 3) 連勝達人：曾達成 >=3 連勝
+    streak = 0
+    best_streak = 0
+    for _, row in df.iterrows():
+        if row["is_correct"] == 1:
+            streak += 1
+            best_streak = max(best_streak, streak)
+        elif row["is_correct"] == 0:
+            streak = 0
+        # is_correct 為 None（未結算）直接略過
+    if best_streak >= 3:
+        badges.append("連勝達人")
+
+    # 4) 主力大師：主力推命中場次 >= 10
+    if main_hits >= 10:
+        badges.append("主力大師")
+
+    return badges
+
+
+def compute_season_score(player: str, days: int = 365):
+    """計算指定期間內的賽季積分（預設最近一年）"""
+    conn = get_db()
+    since = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+    df = pd.read_sql_query(
+        """
+        SELECT is_correct, is_main, created_at
+        FROM predictions
+        WHERE player=? AND created_at >= ?
+        """,
+        conn,
+        params=(player, since),
+    )
+    conn.close()
+
+    if df.empty:
+        return 0
+
+    score = 0
+    for _, row in df.iterrows():
+        if row["is_correct"] == 1:
+            # 一般命中 +2
+            score += 2
+            # 主力推再額外 +3（總共等於 5）
+            if row["is_main"] == 1:
+                score += 3
+    return score
+
 
 # ===================== Streamlit UI =====================
 
@@ -1055,6 +1206,19 @@ elif active_page == "我的勝率":
     if not current_user:
         st.warning("請先登入後再查看。")
     else:
+        # 先顯示自己的徽章與賽季積分
+        badges = compute_player_badges(current_user)
+        season_score = compute_season_score(current_user, days=365)
+
+        st.subheader("我的成就與賽季積分")
+        if badges:
+            st.write(f"🥇 徽章：{'、'.join(badges)}")
+        else:
+            st.write("目前尚未取得任何徽章，加油！")
+        st.write(f"🏆 賽季積分（最近一年）：{season_score} 分")
+
+        st.markdown("---")
+
         st.subheader("總成績（全部已結算比賽）")
         df_my = get_leaderboard(" AND player=?", (current_user,), use_spread=False)
         if df_my.empty:
@@ -1206,8 +1370,19 @@ elif active_page == "管理員後台":
                         st.rerun()
         else:
             st.info("目前尚無使用者資料。")
+            
+            st.markdown("---")
+            st.markdown("### 📂 重新同步賽程 games 資料表")
 
-        # --- 管理員手動調整點數 ---
+            st.caption("說明：會清空 games 表並以目前 get_games() 抓到的賽程重建，"
+                   "不會動到 users 或 predictions。正式賽前或測試階段可用。")
+
+        if  st.button("重新同步 games 表（請謹慎使用）"):
+            resync_games_table()
+            st.success("已重新同步 games 資料表，接下來的賽程 / 自動結算會使用新資料。")
+
+
+                # --- 管理員手動調整點數 ---
         st.markdown("---")
         st.markdown("### 💰 手動補充 / 扣除玩家點數")
         if not users_df.empty:
@@ -1226,8 +1401,6 @@ elif active_page == "管理員後台":
                 st.success(f"已為 {target_user2} 調整點數 {delta} 點。" + (f" 備註：{reason}" if reason else ""))
                 st.rerun()
 
-        # 後面「排行榜 / 全部預測紀錄 / 點數異動紀錄」保持你原本的程式就好
-
         # -------- 排行榜區 --------
         st.markdown("---")
         st.subheader("🏆 排行榜")
@@ -1242,6 +1415,14 @@ elif active_page == "管理員後台":
             if lb_all.empty:
                 st.info("尚無已結算的資料。")
             else:
+                # 加上賽季積分與徽章
+                lb_all["season_score"] = lb_all["player"].apply(
+                    lambda p: compute_season_score(p, days=365)
+                )
+                lb_all["badges"] = lb_all["player"].apply(
+                    lambda p: "、".join(compute_player_badges(p)) if compute_player_badges(p) else ""
+                )
+
                 lb_show = lb_all.rename(
                     columns={
                         "player": "玩家",
@@ -1249,8 +1430,17 @@ elif active_page == "管理員後台":
                         "win_games": "命中場次",
                         "win_rate": "勝率%",
                         "avg_conf": "平均信心",
+                        "season_score": "賽季積分",
+                        "badges": "徽章",
                     }
                 )
+
+                # 排序：先看賽季積分，再看勝率與出手場次
+                lb_show = lb_show.sort_values(
+                    by=["賽季積分", "勝率%", "總場次"],
+                    ascending=[False, False, False],
+                )
+
                 st.dataframe(lb_show, use_container_width=True)
 
         with tab2:
@@ -1310,102 +1500,87 @@ elif active_page == "管理員後台":
                         "is_admin": "是否管理員",
                     }
                 )
-                st.dataframe(
-                    pts_df[["玩家", "點數", "是否管理員", "是否封鎖"]],
-                    use_container_width=True,
-                )
+                st.dataframe(pts_df[["玩家", "點數", "是否封鎖", "是否管理員"]], use_container_width=True)
 
-        # -------- 全部預測紀錄 --------
+        # -------- 單場比賽自動結算 --------
         st.markdown("---")
-        st.subheader("📋 全部預測紀錄（可篩選）")
-        preds_df = get_all_predictions_join()
-        if preds_df.empty:
-            st.info("目前尚無任何預測紀錄。")
-        else:
-            col_a, col_b, col_c = st.columns(3)
-            with col_a:
-                players = ["全部"] + sorted(preds_df["player"].unique().tolist())
-                sel_player = st.selectbox("玩家", players)
-            with col_b:
-                game_ids = ["全部"] + sorted(preds_df["game_id"].unique().tolist())
-                sel_game = st.selectbox("比賽編號 game_id", game_ids)
-            with col_c:
-                date_min = preds_df["created_at"].min()[:10]
-                date_max = preds_df["created_at"].max()[:10]
-                date_filter = st.date_input(
-                    "起訖日期（依 created_at）",
-                    value=(datetime.fromisoformat(date_min), datetime.fromisoformat(date_max)),
-                )
+        st.subheader("⚙ 單場比賽自動結算（statsapi）")
 
-            filtered = preds_df.copy()
-            if sel_player != "全部":
-                filtered = filtered[filtered["player"] == sel_player]
-            if sel_game != "全部":
-                filtered = filtered[filtered["game_id"] == sel_game]
-            if isinstance(date_filter, tuple) and len(date_filter) == 2:
-                start_d, end_d = date_filter
-                filtered = filtered[
-                    (filtered["created_at"] >= start_d.strftime("%Y-%m-%d"))
-                    & (filtered["created_at"] <= end_d.strftime("%Y-%m-%d") + "T23:59:59")
+        # 從 predictions 取得目前有預測紀錄的 game_id
+        used_game_ids = get_distinct_game_ids_in_predictions()
+        if not used_game_ids:
+            st.info("目前沒有任何預測紀錄，無需結算。")
+        else:
+            # 從 games 表抓出這些 game_id 的實際賽程資訊
+            conn_games = get_db()
+            games_df = pd.read_sql_query(
+                """
+                SELECT game_id, away_team, home_team, game_datetime
+                FROM games
+                WHERE game_id IN ({})
+                ORDER BY game_datetime
+                """.format(",".join(["?"] * len(used_game_ids))),
+                conn_games,
+                params=used_game_ids,
+            )
+            conn_games.close()
+
+            if games_df.empty:
+                st.warning("games 表中找不到對應的賽程資料，建議先使用上方的『重新同步 games 表』功能。")
+            else:
+                game_choices = [
+                    f"{row['game_id']} | {row['away_team']} @ {row['home_team']} | {row['game_datetime']}"
+                    for _, row in games_df.iterrows()
                 ]
+                selected_game_str = st.selectbox("選擇要自動結算的比賽", game_choices)
 
-            filtered["away_zh"] = filtered["away_team"].map(
-                lambda x: TEAM_NAME_ZH.get(x, x)
-            )
-            filtered["home_zh"] = filtered["home_team"].map(
-                lambda x: TEAM_NAME_ZH.get(x, x)
-            )
+                if selected_game_str:
+                    selected_game_id = selected_game_str.split("|")[0].strip()
+                    st.write(f"已選擇比賽編號：`{selected_game_id}`")
 
-            filtered = filtered.rename(
-                columns={
-                    "id": "紀錄ID",
-                    "player": "玩家",
-                    "game_id": "比賽編號",
-                    "game_datetime": "開賽時間",
-                    "pick": "勝負預測",
-                    "spread_pick": "讓分預測",
-                    "confidence": "信心星數",
-                    "is_correct": "勝負命中",
-                    "spread_result": "讓分命中",
-                    "is_main": "主力推",
-                    "created_at": "建立時間",
-                }
-            )
+                    # 顯示目前這場在 DB 中的預測概況（所有玩家）
+                    with st.expander("查看此場目前預測紀錄（所有玩家）"):
+                        all_preds_df = get_all_predictions_join()
+                        game_df = all_preds_df[all_preds_df["game_id"] == selected_game_id]
+                        st.dataframe(game_df, use_container_width=True)
 
-            show_cols = [
-                "紀錄ID",
-                "玩家",
-                "比賽編號",
-                "away_zh",
-                "home_zh",
-                "開賽時間",
-                "勝負預測",
-                "讓分預測",
-                "信心星數",
-                "勝負命中",
-                "讓分命中",
-                "主力推",
-                "建立時間",
-            ]
-            st.dataframe(filtered[show_cols], use_container_width=True)
+                    if st.button("從 statsapi 抓取比分並自動結算這場比賽"):
+                        with st.spinner("從 statsapi 抓取最終比分中，請稍候..."):
+                            away_score, home_score, status_str = fetch_game_final_score_from_statsapi(
+                                selected_game_id
+                            )
 
-        # -------- 點數異動紀錄 --------
+                        if away_score is None or home_score is None:
+                            st.error(f"無法取得有效比分（狀態：{status_str}），請確認比賽是否已結束。")
+                        else:
+                            st.success(
+                                f"抓到比分：客隊 {away_score} 分，主隊 {home_score} 分（狀態：{status_str}）。"
+                            )
+
+                            # 決定勝負結果 winner_pick
+                            if away_score > home_score:
+                                winner_pick = "away"
+                            elif home_score > away_score:
+                                winner_pick = "home"
+                            else:
+                                # 平手的情況先視為無法結算（MLB 正式賽理論上不會以平手結束）
+                                st.error("比分為平手，暫不自動結算，請手動處理。")
+                                winner_pick = None
+
+                            # 目前先不自動判斷讓分結果，直接給 "push"
+                            spread_winner = "push"
+
+                            if winner_pick is not None:
+                                # 呼叫原本結算函式
+                                set_game_result(selected_game_id, winner_pick, spread_winner)
+                                st.success("已依據 statsapi 比分完成此場比賽的自動結算。")
+
+                # -------- 點數異動紀錄 --------
         st.markdown("---")
-        st.subheader("📜 點數異動紀錄（最近 100 筆）")
-        conn = get_db()
-        logs_df = pd.read_sql_query(
-            """
-            SELECT username, delta, reason, created_at
-            FROM points_logs
-            ORDER BY created_at DESC
-            LIMIT 100
-            """,
-            conn,
-        )
-        conn.close()
-        if logs_df.empty:
-            st.info("目前尚無點數異動紀錄。")
-        else:
+        st.markdown("### 📜 點數異動紀錄（最近 100 筆）")
+        logs_all = get_recent_points_logs_all(100)
+        if logs_all:
+            logs_df = pd.DataFrame(logs_all)
             logs_df = logs_df.rename(
                 columns={
                     "username": "玩家",
@@ -1414,10 +1589,16 @@ elif active_page == "管理員後台":
                     "created_at": "時間",
                 }
             )
-            st.dataframe(logs_df, use_container_width=True)
+            st.dataframe(
+                logs_df[["玩家", "變動點數", "原因", "時間"]],
+                use_container_width=True,
+            )
+        else:
+            st.write("尚無點數異動紀錄。")
 
         st.markdown("---")
         st.subheader("📤 匯出所有預測為 CSV")
         if st.button("匯出 predictions_export.csv"):
             path = export_predictions_to_csv()
             st.success(f"已匯出到 {path}")
+
