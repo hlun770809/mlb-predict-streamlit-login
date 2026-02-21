@@ -194,7 +194,8 @@ def init_db():
                 is_admin INTEGER DEFAULT 0,
                 is_blocked INTEGER DEFAULT 0,
                 points INTEGER DEFAULT 100,
-                last_bonus_date TEXT
+                last_bonus_date TEXT,
+                is_active INTEGER DEFAULT 0
             )
         """)
         c.execute("""
@@ -256,11 +257,13 @@ def init_db():
             )
         conn.commit()
     else:
+        # 這裡是舊 DB 版本升級：逐一嘗試加欄位
         for col_def in [
             ("is_admin", "INTEGER", 0),
             ("is_blocked", "INTEGER", 0),
             ("points", "INTEGER", 100),
             ("last_bonus_date", "TEXT", "NULL"),
+            ("is_active", "INTEGER", 1),  # 新增：是否已啟用（1=已啟用,0=待審核）
         ]:
             col, col_type, default = col_def
             try:
@@ -268,11 +271,13 @@ def init_db():
                 conn.commit()
             except sqlite3.OperationalError:
                 pass
+
         try:
             c.execute("ALTER TABLE predictions ADD COLUMN is_main INTEGER DEFAULT 0")
             conn.commit()
         except sqlite3.OperationalError:
             pass
+
         try:
             c.execute("""
                 CREATE TABLE points_logs (
@@ -286,7 +291,9 @@ def init_db():
             conn.commit()
         except sqlite3.OperationalError:
             pass
+
     conn.close()
+
 
 def get_db():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -294,21 +301,34 @@ def get_db():
 def get_or_create_user(username, password):
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT username, password, is_admin, is_blocked, points FROM users WHERE username=?", (username,))
+    c.execute(
+        "SELECT username, password, is_admin, is_blocked, points, is_active FROM users WHERE username=?",
+        (username,),
+    )
     row = c.fetchone()
+
+    # 已有帳號：只用來檢查登入，不在這裡處理審核邏輯
     if row:
         if row[1] == password:
             conn.close()
-            return True, bool(row[2]), bool(row[3])
+            is_admin = bool(row[2])
+            is_blocked = bool(row[3])
+            return True, is_admin, is_blocked
         else:
             conn.close()
             return False, False, False
+
+    # 沒有帳號：建立新帳號，預設 is_active=0, points=0
     is_admin = 1 if (username == "admin" and password == "admin123") else 0
     is_blocked = 0
+
     try:
         c.execute(
-            "INSERT INTO users (username, password, is_admin, is_blocked, points) VALUES (?, ?, ?, ?, 100)",
-            (username, password, is_admin, is_blocked),
+            """
+            INSERT INTO users (username, password, is_admin, is_blocked, points, last_bonus_date, is_active)
+            VALUES (?, ?, ?, ?, 0, NULL, ?)
+            """,
+            (username, password, is_admin, is_blocked, 1 if is_admin else 0),
         )
         conn.commit()
         conn.close()
@@ -316,6 +336,19 @@ def get_or_create_user(username, password):
     except sqlite3.IntegrityError:
         conn.close()
         return False, False, False
+
+        
+def get_user_row(username):
+    """只查詢使用者資料，不自動建立帳號"""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "SELECT username, password, is_admin, is_blocked, points, is_active FROM users WHERE username=?",
+        (username,),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row
 
 def get_user_points(username):
     conn = get_db()
@@ -607,22 +640,54 @@ if current_user:
         st.session_state.pop("is_admin", None)
         st.session_state["active_page"] = "明日賽程"
         st.rerun()
+
 else:
     input_user = st.sidebar.text_input("暱稱（帳號）")
     input_pwd = st.sidebar.text_input("密碼", type="password")
     if st.sidebar.button("登入 / 註冊"):
         if input_user and input_pwd:
-            ok, admin_flag, blocked_flag = get_or_create_user(input_user, input_pwd)
-            if ok:
-                st.session_state.current_user = input_user
-                st.session_state.is_admin = admin_flag
-                st.session_state["active_page"] = "明日賽程"
-                st.sidebar.success(f"已登入：{input_user}" + ("（管理員）" if admin_flag else ""))
-                st.rerun()
+            # 先查有沒有這個帳號
+            row = get_user_row(input_user)
+            if row:
+                # 已存在帳號：檢查密碼 + 狀態
+                username_db, pwd_db, is_admin_db, is_blocked_db, points_db, is_active_db = row
+                if pwd_db != input_pwd:
+                    st.sidebar.error("登入失敗：帳號已存在但密碼不符。")
+                else:
+                    is_admin_flag = bool(is_admin_db)
+                    is_blocked_flag = bool(is_blocked_db)
+                    is_active_flag = bool(is_active_db)
+                    if is_blocked_flag:
+                        st.sidebar.error("此帳號已被管理員封鎖。")
+                    elif (not is_active_flag) and (not is_admin_flag):
+                        st.sidebar.warning("帳號已建立，但尚未通過管理員審核，請稍後再試。")
+                    else:
+                        st.session_state.current_user = username_db
+                        st.session_state.is_admin = is_admin_flag
+                        st.session_state["active_page"] = "明日賽程"
+                        st.sidebar.success(
+                            f"已登入：{username_db}" + ("（管理員）" if is_admin_flag else "")
+                        )
+                        st.rerun()
             else:
-                st.sidebar.error("登入失敗：帳號已存在但密碼不符。")
+                # 沒有帳號：建立一個新的（預設 is_active=0, points=0）
+                ok, admin_flag, blocked_flag = get_or_create_user(input_user, input_pwd)
+                if ok:
+                    if admin_flag:
+                        # admin 直接啟用
+                        st.session_state.current_user = input_user
+                        st.session_state.is_admin = True
+                        st.session_state["active_page"] = "明日賽程"
+                        st.sidebar.success("已以管理員身分登入。")
+                        st.rerun()
+                    else:
+                        st.sidebar.success("註冊成功！帳號已送交管理員審核，通過後才能登入使用。")
+                else:
+                    st.sidebar.error("登入失敗：帳號已存在但密碼不符。")
         else:
             st.sidebar.error("請輸入暱稱和密碼。")
+
+
 
 current_user = st.session_state.get("current_user", None)
 is_admin = st.session_state.get("is_admin", False)
@@ -1039,6 +1104,70 @@ elif active_page == "管理員後台":
     if not is_admin:
         st.warning("此區僅限管理員登入使用。")
     else:
+        # --- 待審核帳號 ---
+        st.subheader("🧾 待審核帳號")
+        conn_pending = get_db()
+        pending_df = pd.read_sql_query(
+            """
+            SELECT id, username, points, is_active
+            FROM users
+            WHERE is_admin = 0
+            ORDER BY id ASC
+            """,
+            conn_pending,
+        )
+        conn_pending.close()
+
+        # 只顯示 is_active = 0 的帳號
+        pending_df = pending_df[pending_df["is_active"] == 0]
+
+        if pending_df.empty:
+            st.info("目前沒有待審核的帳號。")
+        else:
+            for _, row in pending_df.iterrows():
+                cols = st.columns([2, 2, 2, 2])
+                with cols[0]:
+                    st.write(f"暱稱：**{row['username']}**")
+                with cols[1]:
+                    init_points = st.number_input(
+                        f"初始點數（{row['username']}）",
+                        min_value=0,
+                        max_value=100000,
+                        value=100,
+                        key=f"init_points_{row['id']}",
+                    )
+                with cols[2]:
+                    st.write(f"目前點數：{row['points']}")
+                with cols[3]:
+                    if st.button(f"通過 {row['username']}", key=f"approve_{row['id']}"):
+                        conn2 = get_db()
+                        c2 = conn2.cursor()
+                        # 設為啟用並給初始點數
+                        c2.execute(
+                            "UPDATE users SET is_active=1, points=? WHERE id=?",
+                            (int(init_points), int(row["id"])),
+                        )
+                        # 寫一筆點數異動紀錄
+                        c2.execute(
+                            """
+                            INSERT INTO points_logs (username, delta, reason, created_at)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (
+                                row["username"],
+                                int(init_points) - int(row["points"]),
+                                f"管理員審核通過，設定初始點數 {int(init_points)} 點",
+                                datetime.now().isoformat(),
+                            ),
+                        )
+                        conn2.commit()
+                        conn2.close()
+                        st.success(f"已通過 {row['username']}，設定初始點數 {int(init_points)} 點。")
+                        st.rerun()
+
+        st.markdown("---")
+
+        # --- 原本的使用者清單 & 封鎖管理 ---
         st.subheader("使用者清單 & 封鎖管理")
         users_df = get_all_users()
         if not users_df.empty:
@@ -1096,6 +1225,8 @@ elif active_page == "管理員後台":
                 log_points_change(target_user2, delta, log_reason)
                 st.success(f"已為 {target_user2} 調整點數 {delta} 點。" + (f" 備註：{reason}" if reason else ""))
                 st.rerun()
+
+        # 後面「排行榜 / 全部預測紀錄 / 點數異動紀錄」保持你原本的程式就好
 
         # -------- 排行榜區 --------
         st.markdown("---")
