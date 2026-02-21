@@ -1,0 +1,1292 @@
+import streamlit as st
+import pandas as pd
+from datetime import datetime, timedelta, timezone, date
+import sqlite3
+import os
+import requests
+
+st.write("這是 MLB_PREDICT Login 版 測試畫面 v4.4（點數紀錄+每日獎勵+補點）")
+
+DB_PATH = "mlb_predictions.db"
+
+# ========= 在這裡填入你的 The Odds API 金鑰 =========
+THE_ODDS_API_KEY = "208a1ed1cbf73d8a1169675d84372d41"
+THE_ODDS_BASE_URL = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
+# ===================================================
+
+# 每日首筆預測獎勵點數
+DAILY_BONUS_POINTS = 10
+
+# ===================== MLB 30 隊中文名 =====================
+
+TEAM_NAME_ZH = {
+    "Arizona Diamondbacks": "亞利桑那 響尾蛇",
+    "Atlanta Braves": "亞特蘭大 勇士",
+    "Baltimore Orioles": "巴爾的摩 金鶯",
+    "Boston Red Sox": "波士頓 紅襪",
+    "Chicago Cubs": "芝加哥 小熊",
+    "Chicago White Sox": "芝加哥 白襪",
+    "Cincinnati Reds": "辛辛那提 紅人",
+    "Cleveland Guardians": "克里夫蘭 守護者",
+    "Colorado Rockies": "科羅拉多 落磯",
+    "Detroit Tigers": "底特律 老虎",
+    "Houston Astros": "休士頓 太空人",
+    "Kansas City Royals": "堪薩斯市 皇家",
+    "Los Angeles Angels": "洛杉磯 天使",
+    "Los Angeles Dodgers": "洛杉磯 道奇",
+    "Miami Marlins": "邁阿密 馬林魚",
+    "Milwaukee Brewers": "密爾瓦基 釀酒人",
+    "Minnesota Twins": "明尼蘇達 雙城",
+    "New York Mets": "紐約 大都會",
+    "New York Yankees": "紐約 洋基",
+    "Oakland Athletics": "奧克蘭 運動家",
+    "Philadelphia Phillies": "費城 費城人",
+    "Pittsburgh Pirates": "匹茲堡 海盜",
+    "San Diego Padres": "聖地牙哥 教士",
+    "San Francisco Giants": "舊金山 巨人",
+    "Seattle Mariners": "西雅圖 水手",
+    "St. Louis Cardinals": "聖路易 紅雀",
+    "Tampa Bay Rays": "坦帕灣 光芒",
+    "Texas Rangers": "德州 遊騎兵",
+    "Toronto Blue Jays": "多倫多 藍鳥",
+    "Washington Nationals": "華盛頓 國民",
+}
+
+# ===================== MLB 明日賽程（statsapi） =====================
+
+def fetch_taiwan_tomorrow_schedule():
+    tz_tw = timezone(timedelta(hours=8))
+    now_tw = datetime.now(tz=tz_tw)
+    tomorrow_tw = (now_tw + timedelta(days=1)).date()
+
+    start_date_us = now_tw.strftime("%Y-%m-%d")
+    end_date_us = (now_tw + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    url = (
+        "https://statsapi.mlb.com/api/v1/schedule"
+        f"?sportId=1&startDate={start_date_us}&endDate={end_date_us}"
+        "&language=en&hydrate=team&timeZone=America/New_York"
+    )
+    resp = requests.get(url, timeout=10)
+    data = resp.json()
+
+    games_data = []
+    for day in data.get("dates", []):
+        for game in day.get("games", []):
+            game_pk = game["gamePk"]
+            away_team = game["teams"]["away"]["team"]["name"]
+            home_team = game["teams"]["home"]["team"]["name"]
+
+            game_dt_utc = datetime.fromisoformat(game["gameDate"].replace("Z", "+00:00"))
+            game_dt_tw = game_dt_utc.astimezone(tz_tw)
+
+            if game_dt_tw.date() != tomorrow_tw:
+                continue
+
+            venue = game.get("venue", {}).get("name", "")
+
+            games_data.append(
+                {
+                    "game_id": str(game_pk),
+                    "away_name": away_team,
+                    "home_name": home_team,
+                    "game_date": tomorrow_tw.strftime("%Y-%m-%d"),
+                    "game_datetime": game_dt_tw.strftime("%Y-%m-%d %H:%M"),
+                    "venue": venue,
+                    "ml_away": 0,
+                    "ml_home": 0,
+                    "runline": "N/A",
+                }
+            )
+    return games_data
+
+@st.cache_data(ttl=300)
+def get_games():
+    try:
+        return fetch_taiwan_tomorrow_schedule()
+    except Exception as e:
+        st.warning(f"抓取 MLB 賽程失敗：{e}")
+        return []
+
+# ===================== The Odds API =====================
+
+@st.cache_data(ttl=300)
+def fetch_mlb_odds():
+    if not THE_ODDS_API_KEY or THE_ODDS_API_KEY == "YOUR_THE_ODDS_API_KEY_HERE":
+        return {}
+
+    params = {
+        "apiKey": THE_ODDS_API_KEY,
+        "regions": "us",
+        "markets": "h2h,spreads,totals",
+        "oddsFormat": "american",
+    }
+    try:
+        resp = requests.get(THE_ODDS_BASE_URL, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        st.warning(f"The Odds API 抓取失敗：{e}")
+        return {}
+
+    odds_map = {}
+    for game in data:
+        away_team = game.get("away_team")
+        home_team = game.get("home_team")
+        if not away_team or not home_team:
+            continue
+
+        bookmakers = game.get("bookmakers", [])
+        if not bookmakers:
+            continue
+        bk = bookmakers[0]
+        markets = bk.get("markets", [])
+
+        moneyline = {"away": None, "home": None}
+        spread = {"point": None, "away": None, "home": None}
+        totals = {"point": None, "over": None, "under": None}
+
+        for m in markets:
+            key = m.get("key")
+            outcomes = m.get("outcomes", [])
+            if key == "h2h":
+                for o in outcomes:
+                    if o.get("name") == away_team:
+                        moneyline["away"] = o.get("price")
+                    elif o.get("name") == home_team:
+                        moneyline["home"] = o.get("price")
+            elif key == "spreads":
+                for o in outcomes:
+                    if o.get("name") == away_team:
+                        spread["away"] = o.get("price")
+                        spread["point"] = o.get("point")
+                    elif o.get("name") == home_team:
+                        spread["home"] = o.get("price")
+                        spread["point"] = o.get("point")
+            elif key == "totals":
+                for o in outcomes:
+                    if o.get("name") == "Over":
+                        totals["over"] = o.get("price")
+                        totals["point"] = o.get("point")
+                    elif o.get("name") == "Under":
+                        totals["under"] = o.get("price")
+                        totals["point"] = o.get("point")
+
+        odds_map[(away_team, home_team)] = {
+            "moneyline": moneyline,
+            "spread": spread,
+            "totals": totals,
+        }
+    return odds_map
+
+# ===================== DB & helpers =====================
+
+def init_db():
+    need_init = not os.path.exists(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if need_init:
+        c.execute("""
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE,
+                password TEXT,
+                is_admin INTEGER DEFAULT 0,
+                is_blocked INTEGER DEFAULT 0,
+                points INTEGER DEFAULT 100,
+                last_bonus_date TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE games (
+                game_id TEXT PRIMARY KEY,
+                away_team TEXT,
+                home_team TEXT,
+                game_date TEXT,
+                game_datetime TEXT,
+                venue TEXT,
+                ml_away REAL,
+                ml_home REAL,
+                runline TEXT,
+                status TEXT DEFAULT 'Scheduled'
+            )
+        """)
+        c.execute("""
+            CREATE TABLE predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id TEXT,
+                player TEXT,
+                pick TEXT,
+                spread_pick TEXT,
+                confidence INTEGER,
+                created_at TEXT,
+                is_correct INTEGER DEFAULT NULL,
+                spread_result INTEGER DEFAULT NULL,
+                is_main INTEGER DEFAULT 0,
+                FOREIGN KEY(game_id) REFERENCES games(game_id)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE points_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT,
+                delta INTEGER,
+                reason TEXT,
+                created_at TEXT
+            )
+        """)
+        games = get_games()
+        for g in games:
+            c.execute(
+                """
+                INSERT OR IGNORE INTO games
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Scheduled')
+                """,
+                (
+                    g["game_id"],
+                    g["away_name"],
+                    g["home_name"],
+                    g["game_date"],
+                    g["game_datetime"],
+                    g["venue"],
+                    g["ml_away"],
+                    g["ml_home"],
+                    g["runline"],
+                ),
+            )
+        conn.commit()
+    else:
+        for col_def in [
+            ("is_admin", "INTEGER", 0),
+            ("is_blocked", "INTEGER", 0),
+            ("points", "INTEGER", 100),
+            ("last_bonus_date", "TEXT", "NULL"),
+        ]:
+            col, col_type, default = col_def
+            try:
+                c.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type} DEFAULT {default}")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+        try:
+            c.execute("ALTER TABLE predictions ADD COLUMN is_main INTEGER DEFAULT 0")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+        try:
+            c.execute("""
+                CREATE TABLE points_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT,
+                    delta INTEGER,
+                    reason TEXT,
+                    created_at TEXT
+                )
+            """)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+    conn.close()
+
+def get_db():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+def get_or_create_user(username, password):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT username, password, is_admin, is_blocked, points FROM users WHERE username=?", (username,))
+    row = c.fetchone()
+    if row:
+        if row[1] == password:
+            conn.close()
+            return True, bool(row[2]), bool(row[3])
+        else:
+            conn.close()
+            return False, False, False
+    is_admin = 1 if (username == "admin" and password == "admin123") else 0
+    is_blocked = 0
+    try:
+        c.execute(
+            "INSERT INTO users (username, password, is_admin, is_blocked, points) VALUES (?, ?, ?, ?, 100)",
+            (username, password, is_admin, is_blocked),
+        )
+        conn.commit()
+        conn.close()
+        return True, bool(is_admin), bool(is_blocked)
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False, False, False
+
+def get_user_points(username):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT points FROM users WHERE username=?", (username,))
+    row = c.fetchone()
+    conn.close()
+    if row is None:
+        return 0
+    return int(row[0])
+
+def update_user_points(username, delta):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "UPDATE users SET points = points + ? WHERE username=?",
+        (delta, username),
+    )
+    conn.commit()
+    conn.close()
+
+def log_points_change(username, delta, reason):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO points_logs (username, delta, reason, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (username, delta, reason, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+def get_latest_points_log(username):
+    conn = get_db()
+    df = pd.read_sql_query(
+        """
+        SELECT delta, reason, created_at
+        FROM points_logs
+        WHERE username=?
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        conn,
+        params=(username,),
+    )
+    conn.close()
+    if df.empty:
+        return None
+    return df.iloc[0]
+
+def apply_daily_bonus_if_needed(username):
+    """若今天尚未發每日加成，發一次性獎勵，回傳 bool 表示是否有發獎金。"""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT last_bonus_date FROM users WHERE username=?", (username,))
+    row = c.fetchone()
+    today_str = date.today().strftime("%Y-%m-%d")
+
+    already_bonus = (row is not None and row[0] == today_str)
+    if not already_bonus:
+        c.execute(
+            "UPDATE users SET points = points + ?, last_bonus_date=? WHERE username=?",
+            (DAILY_BONUS_POINTS, today_str, username),
+        )
+        conn.commit()
+    conn.close()
+    return not already_bonus
+
+def save_prediction(game_id, player, pick, spread_pick, confidence):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO predictions (game_id, player, pick, spread_pick, confidence, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (game_id, player, pick, spread_pick, confidence, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+def set_main_pick(player, record_id):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE predictions SET is_main=0 WHERE player=?", (player,))
+    c.execute("UPDATE predictions SET is_main=1 WHERE player=? AND id=?", (player, record_id))
+    conn.commit()
+    conn.close()
+
+def get_player_latest_prediction(game_id, player):
+    conn = get_db()
+    df = pd.read_sql_query(
+        """
+        SELECT * FROM predictions
+        WHERE game_id=? AND player=?
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        conn,
+        params=(game_id, player),
+    )
+    conn.close()
+    return df.iloc[0] if not df.empty else None
+
+def set_game_result(game_id, winner_pick, spread_winner):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        """
+        UPDATE predictions
+        SET is_correct = CASE WHEN pick=? THEN 1 ELSE 0 END
+        WHERE game_id=?
+        """,
+        (winner_pick, game_id),
+    )
+    if spread_winner == "push":
+        c.execute(
+            """
+            UPDATE predictions
+            SET spread_result = NULL
+            WHERE game_id=?
+            """,
+            (game_id,),
+        )
+    else:
+        c.execute(
+            """
+            UPDATE predictions
+            SET spread_result = CASE WHEN spread_pick=? THEN 1 ELSE 0 END
+            WHERE game_id=?
+            """,
+            (spread_winner, game_id),
+        )
+    conn.commit()
+
+    df = pd.read_sql_query(
+        """
+        SELECT player, is_correct, is_main
+        FROM predictions
+        WHERE game_id=?
+        """,
+        conn,
+        params=(game_id,),
+    )
+    if not df.empty:
+        for _, row in df.iterrows():
+            player = row["player"]
+            is_correct = row["is_correct"]
+            is_main = row["is_main"]
+            if is_correct == 1:
+                bonus = 40 + (20 if is_main == 1 else 0)
+                c.execute(
+                    "UPDATE users SET points = points + ? WHERE username=?",
+                    (bonus, player),
+                )
+                conn.commit()
+                reason = "主力推命中獎勵" if is_main == 1 else "預測命中獎勵"
+                log_points_change(player, bonus, reason)
+
+    conn.close()
+
+def get_leaderboard(where_clause="", params=(), use_spread=False):
+    col = "spread_result" if use_spread else "is_correct"
+    conn = get_db()
+    query = f"""
+        SELECT 
+            player,
+            COUNT(*) as total_games,
+            SUM(CASE WHEN {col}=1 THEN 1 ELSE 0 END) as win_games,
+            ROUND(AVG({col})*100.0, 1) as win_rate,
+            AVG(confidence) as avg_conf
+        FROM predictions
+        WHERE {col} IS NOT NULL
+        {where_clause}
+        GROUP BY player
+        HAVING total_games > 0
+        ORDER BY win_rate DESC, win_games DESC
+    """
+    df = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return df
+
+def export_predictions_to_csv():
+    conn = get_db()
+    df = pd.read_sql_query("SELECT * FROM predictions", conn)
+    conn.close()
+    path = "predictions_export.csv"
+    df.to_csv(path, index=False)
+    return path
+
+def get_all_users():
+    conn = get_db()
+    df = pd.read_sql_query("SELECT id, username, is_admin, is_blocked, points FROM users", conn)
+    conn.close()
+    return df
+
+def update_user_block(username, blocked: bool):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "UPDATE users SET is_blocked=? WHERE username=?",
+        (1 if blocked else 0, username),
+    )
+    conn.commit()
+    conn.close()
+
+def get_all_predictions_join():
+    conn = get_db()
+    df = pd.read_sql_query(
+        """
+        SELECT 
+            p.id,
+            p.player,
+            p.game_id,
+            g.away_team,
+            g.home_team,
+            g.game_datetime,
+            p.pick,
+            p.spread_pick,
+            p.confidence,
+            p.is_correct,
+            p.spread_result,
+            p.is_main,
+            p.created_at
+        FROM predictions p
+        LEFT JOIN games g ON p.game_id = g.game_id
+        ORDER BY p.created_at DESC
+        """,
+        conn,
+    )
+    conn.close()
+    return df
+
+def is_user_blocked(username):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT is_blocked FROM users WHERE username=?", (username,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return bool(row[0])
+    return False
+
+# ======= 週 / 月起始日期 helper =======
+
+def get_week_start_today():
+    today = date.today()
+    start = today - timedelta(days=today.weekday())  # Monday = 0
+    return start.strftime("%Y-%m-%d")
+
+def get_month_start_today():
+    today = date.today()
+    start = today.replace(day=1)
+    return start.strftime("%Y-%m-%d")
+
+# ===================== Streamlit UI =====================
+
+st.set_page_config(page_title="⚾ MLB 預測王 v4.4", layout="wide", page_icon="⚾")
+st.title("⚾ MLB 明日賽程預測系統（登入 + 管理員 + 盤口 + 點數 + 排行榜 + 每日獎勵）")
+
+init_db()
+
+# ---- Sidebar 登入 / 登出 ----
+st.sidebar.header("玩家登入 / 註冊")
+current_user = st.session_state.get("current_user", None)
+is_admin = st.session_state.get("is_admin", False)
+
+if current_user:
+    role = "管理員" if is_admin else "一般玩家"
+    blocked_flag = is_user_blocked(current_user)
+    points = get_user_points(current_user)
+    if blocked_flag:
+        role += "（已被封鎖）"
+    st.sidebar.success(f"目前使用者：{current_user}（{role}）")
+    st.sidebar.info(f"目前點數：{points} 點")
+
+    # 最近一次點數異動
+    log = get_latest_points_log(current_user)
+    if log is not None:
+        delta = int(log["delta"])
+        reason = log["reason"] or ""
+        ts = log["created_at"][:16]
+        symbol = "+" if delta > 0 else ""
+        st.sidebar.caption(f"最近點數變動：{symbol}{delta} 點（{reason}，{ts}）")
+
+    if st.sidebar.button("登出"):
+        st.session_state.pop("current_user", None)
+        st.session_state.pop("is_admin", None)
+        st.session_state["active_page"] = "明日賽程"
+        st.rerun()
+else:
+    input_user = st.sidebar.text_input("暱稱（帳號）")
+    input_pwd = st.sidebar.text_input("密碼", type="password")
+    if st.sidebar.button("登入 / 註冊"):
+        if input_user and input_pwd:
+            ok, admin_flag, blocked_flag = get_or_create_user(input_user, input_pwd)
+            if ok:
+                st.session_state.current_user = input_user
+                st.session_state.is_admin = admin_flag
+                st.session_state["active_page"] = "明日賽程"
+                st.sidebar.success(f"已登入：{input_user}" + ("（管理員）" if admin_flag else ""))
+                st.rerun()
+            else:
+                st.sidebar.error("登入失敗：帳號已存在但密碼不符。")
+        else:
+            st.sidebar.error("請輸入暱稱和密碼。")
+
+current_user = st.session_state.get("current_user", None)
+is_admin = st.session_state.get("is_admin", False)
+current_blocked = is_user_blocked(current_user) if current_user else False
+
+# ---- Sidebar 功能選單 ----
+st.sidebar.markdown("---")
+options = ["明日賽程", "預測中心", "我的預測", "我的勝率"]
+if is_admin:
+    options.append("管理員後台")
+
+menu_choice = st.sidebar.radio("功能選單", options, key="menu_page")
+
+if "active_page" not in st.session_state:
+    st.session_state["active_page"] = "明日賽程"
+if menu_choice != st.session_state["active_page"]:
+    st.session_state["active_page"] = menu_choice
+
+active_page = st.session_state["active_page"]
+
+odds_map = fetch_mlb_odds()
+
+# ===================== 明日賽程 =====================
+
+if active_page == "明日賽程":
+    st.header("📅 明日賽程（statsapi + 市場盤口）")
+    games = get_games()
+    if not games:
+        st.info("目前查不到『台灣明日』的 MLB 賽程（可能尚未排定）。")
+    else:
+        df = pd.DataFrame(games)
+        df["客隊"] = df["away_name"].map(lambda x: TEAM_NAME_ZH.get(x, x)) + " (客隊)"
+        df["主隊"] = df["home_name"].map(lambda x: TEAM_NAME_ZH.get(x, x)) + " (主隊)"
+
+        ml_away_list, ml_home_list = [], []
+        spread_point_list, spread_away_list, spread_home_list = [], [], []
+        total_point_list, total_over_list, total_under_list = [], [], []
+
+        for _, row in df.iterrows():
+            key = (row["away_name"], row["home_name"])
+            odds = odds_map.get(key, {})
+            ml = odds.get("moneyline", {})
+            sp = odds.get("spread", {})
+            tot = odds.get("totals", {})
+
+            ml_away_list.append(ml.get("away"))
+            ml_home_list.append(ml.get("home"))
+            spread_point_list.append(sp.get("point"))
+            spread_away_list.append(sp.get("away"))
+            spread_home_list.append(sp.get("home"))
+            total_point_list.append(tot.get("point"))
+            total_over_list.append(tot.get("over"))
+            total_under_list.append(tot.get("under"))
+
+        df["客勝賠率"] = ml_away_list
+        df["主勝賠率"] = ml_home_list
+        df["讓分盤"] = spread_point_list
+        df["客隊讓分賠率"] = spread_away_list
+        df["主隊讓分賠率"] = spread_home_list
+        df["大小分盤"] = total_point_list
+        df["大分賠率"] = total_over_list
+        df["小分賠率"] = total_under_list
+
+        df_show = df[
+            [
+                "客隊",
+                "主隊",
+                "game_datetime",
+                "venue",
+                "客勝賠率",
+                "主勝賠率",
+                "讓分盤",
+                "客隊讓分賠率",
+                "主隊讓分賠率",
+                "大小分盤",
+                "大分賠率",
+                "小分賠率",
+            ]
+        ].rename(columns={"game_datetime": "開賽時間", "venue": "球場"})
+        st.dataframe(df_show, use_container_width=True)
+
+        st.subheader("快速進入預測中心")
+        cols = st.columns(len(games))
+        for i, g in enumerate(games):
+            with cols[i]:
+                away_zh = TEAM_NAME_ZH.get(g["away_name"], g["away_name"])
+                home_zh = TEAM_NAME_ZH.get(g["home_name"], g["home_name"])
+                st.markdown(
+                    f"**{away_zh} (客隊)**<br><small>@ {home_zh} (主隊)</small>",
+                    unsafe_allow_html=True,
+                )
+                if st.button("預測這場", key=f"goto_{g['game_id']}"):
+                    st.session_state.selected_game = g
+                    st.session_state["active_page"] = "預測中心"
+                    st.rerun()
+
+# ===================== 預測中心（純預測 + 每日加成） =====================
+
+elif active_page == "預測中心":
+    st.header("🎯 預測中心")
+    if "selected_game" not in st.session_state:
+        st.info("請先到『明日賽程』選一場比賽。")
+    elif not current_user:
+        st.warning("請先在左側登入玩家，再進行預測。")
+    elif current_blocked:
+        st.error("此帳號已被管理員封鎖，目前無法提交新的預測。")
+    else:
+        g = st.session_state.selected_game
+        away_en = g["away_name"]
+        home_en = g["home_name"]
+        away_zh = TEAM_NAME_ZH.get(away_en, away_en) + " (客隊)"
+        home_zh = TEAM_NAME_ZH.get(home_en, home_en) + " (主隊)"
+
+        col_main, col_odds = st.columns([2, 1])
+
+        with col_main:
+            st.markdown(f"### {away_zh} @ {home_zh}")
+            st.caption(f"{g['game_datetime']} • {g['venue']}")
+
+            last = get_player_latest_prediction(g["game_id"], current_user)
+            user_points = get_user_points(current_user)
+            st.write(f"目前點數：{user_points} 點（每次預測消耗 20 點，今日首筆預測額外 +{DAILY_BONUS_POINTS} 點）")
+
+            col1, col2, col3 = st.columns([2, 2, 2])
+            with col1:
+                pick_radio = st.radio(
+                    "勝負預測",
+                    ["客勝", "主勝"],
+                    horizontal=True,
+                    index=0 if last is None or last["pick"] == "away" else 1,
+                )
+            with col2:
+                spread_radio = st.radio(
+                    "讓分盤",
+                    ["不玩讓分", "主隊過盤", "客隊過盤"],
+                    horizontal=True,
+                )
+            with col3:
+                conf_val = st.slider(
+                    "信心 ⭐",
+                    1,
+                    3,
+                    2 if last is None else int(last["confidence"]),
+                )
+
+            if st.button("💾 儲存預測"):
+                if user_points < 20:
+                    st.error("點數不足，無法預測（每次需 20 點）。")
+                else:
+                    pick_val = "away" if pick_radio == "客勝" else "home"
+                    if spread_radio == "主隊過盤":
+                        spread_val = "home_cover"
+                    elif spread_radio == "客隊過盤":
+                        spread_val = "away_cover"
+                    else:
+                        spread_val = "none"
+
+                    save_prediction(
+                        g["game_id"],
+                        current_user,
+                        pick_val,
+                        spread_val,
+                        conf_val,
+                    )
+                    update_user_points(current_user, -20)
+                    log_points_change(current_user, -20, "預測消耗點數 20")
+
+                    got_bonus = apply_daily_bonus_if_needed(current_user)
+                    if got_bonus:
+                        log_points_change(current_user, DAILY_BONUS_POINTS, "每日首筆預測獎勵")
+                        st.success(
+                            f"已儲存！已扣除 20 點，今日首筆預測額外獲得 +{DAILY_BONUS_POINTS} 點。"
+                        )
+                    else:
+                        st.success("已儲存！已扣除 20 點。")
+                    st.rerun()
+
+            if last is not None:
+                last_pick = "客勝" if last["pick"] == "away" else "主勝"
+                if last["spread_pick"] == "home_cover":
+                    last_spread = "主隊過盤"
+                elif last["spread_pick"] == "away_cover":
+                    last_spread = "客隊過盤"
+                else:
+                    last_spread = "不玩讓分"
+                st.caption(
+                    f"上次：勝負 {last_pick}，讓分 {last_spread}，"
+                    f"{last['confidence']}⭐，時間 {last['created_at'][:19]}"
+                )
+
+        with col_odds:
+            st.subheader("📊 市場盤口（The Odds API）")
+            odds = odds_map.get((away_en, home_en))
+            if not odds:
+                st.info("目前此場尚未開盤或 API 無資料。")
+            else:
+                ml = odds.get("moneyline", {})
+                sp = odds.get("spread", {})
+                tot = odds.get("totals", {})
+
+                st.markdown("**Moneyline（勝負賠率）**")
+                st.write(f"{away_zh}: {ml.get('away')}")
+                st.write(f"{home_zh}: {ml.get('home')}")
+
+                st.markdown("---")
+                st.markdown("**Run Line（讓分盤）**")
+                point = sp.get("point")
+                if point is not None:
+                    st.write(f"讓分數：{point}")
+                st.write(f"{away_zh} 賠率: {sp.get('away')}")
+                st.write(f"{home_zh} 賠率: {sp.get('home')}")
+
+                st.markdown("---")
+                st.markdown("**Totals（大小分）**")
+                t_point = tot.get("point")
+                if t_point is not None:
+                    st.write(f"大小分盤：{t_point}")
+                st.write(f"大分 Over 賠率: {tot.get('over')}")
+                st.write(f"小分 Under 賠率: {tot.get('under')}")
+
+# ===================== 我的預測（主力推卡片） =====================
+
+elif active_page == "我的預測":
+    st.header("📓 我的預測紀錄")
+    if not current_user:
+        st.warning("請先登入後再查看自己的預測紀錄。")
+    else:
+        conn = get_db()
+        df = pd.read_sql_query(
+            """
+            SELECT 
+                p.id,
+                p.game_id,
+                g.away_team,
+                g.home_team,
+                g.game_datetime,
+                p.pick,
+                p.spread_pick,
+                p.confidence,
+                p.is_correct,
+                p.spread_result,
+                p.is_main,
+                p.created_at
+            FROM predictions p
+            LEFT JOIN games g ON p.game_id = g.game_id
+            WHERE p.player=?
+            ORDER BY p.created_at DESC
+            """,
+            conn,
+            params=(current_user,),
+        )
+        conn.close()
+
+        if df.empty:
+            st.info("你目前沒有任何預測紀錄。")
+        else:
+            col1, col2 = st.columns(2)
+            min_date = df["created_at"].min()[:10]
+            max_date = df["created_at"].max()[:10]
+            with col1:
+                start_d = st.date_input("起始日期", datetime.fromisoformat(min_date))
+            with col2:
+                end_d = st.date_input("結束日期", datetime.fromisoformat(max_date))
+
+            filtered = df[
+                (df["created_at"] >= start_d.strftime("%Y-%m-%d"))
+                & (df["created_at"] <= end_d.strftime("%Y-%m-%d") + "T23:59:59")
+            ].copy()
+
+            filtered["客隊"] = filtered["away_team"].map(lambda x: TEAM_NAME_ZH.get(x, x))
+            filtered["主隊"] = filtered["home_team"].map(lambda x: TEAM_NAME_ZH.get(x, x))
+
+            filtered = filtered.rename(
+                columns={
+                    "id": "紀錄ID",
+                    "game_id": "比賽編號",
+                    "game_datetime": "開賽時間",
+                    "pick": "勝負預測",
+                    "spread_pick": "讓分預測",
+                    "confidence": "信心星數",
+                    "is_correct": "勝負命中",
+                    "spread_result": "讓分命中",
+                    "is_main": "主力推",
+                    "created_at": "建立時間",
+                }
+            )
+
+            main_df = filtered[filtered["主力推"] == 1]
+            other_df = filtered[filtered["主力推"] != 1]
+
+            st.markdown("### ⭐ 我的主力推薦")
+            if main_df.empty:
+                st.info("目前尚未選擇主力推，請從下方列表挑一場設定。")
+            else:
+                m = main_df.iloc[0]
+                bg = """
+                <div style="
+                    border-radius: 8px;
+                    padding: 12px 16px;
+                    margin-bottom: 16px;
+                    background: linear-gradient(90deg, #ff9a3c, #ffcc70);
+                    color: #000000;
+                    font-weight: 600;
+                ">
+                    <div style="font-size: 18px; margin-bottom: 4px;">
+                        ⭐ 主力推：{away} @ {home}
+                    </div>
+                    <div style="font-size: 14px;">
+                        開賽時間：{dt}　｜　勝負：{pick}　讓分：{spread}　信心：{conf}⭐
+                    </div>
+                    <div style="font-size: 12px; margin-top: 4px;">
+                        建立時間：{created}
+                    </div>
+                </div>
+                """.format(
+                    away=m["客隊"],
+                    home=m["主隊"],
+                    dt=m["開賽時間"],
+                    pick=m["勝負預測"],
+                    spread=m["讓分預測"],
+                    conf=m["信心星數"],
+                    created=m["建立時間"][:19],
+                )
+                st.markdown(bg, unsafe_allow_html=True)
+
+            st.markdown("### 📋 全部預測紀錄")
+            if other_df.empty and main_df.empty:
+                st.info("你目前沒有任何預測紀錄。")
+            else:
+                display_df = pd.concat([main_df, other_df])
+                show_cols = [
+                    "紀錄ID",
+                    "比賽編號",
+                    "客隊",
+                    "主隊",
+                    "開賽時間",
+                    "勝負預測",
+                    "讓分預測",
+                    "信心星數",
+                    "勝負命中",
+                    "讓分命中",
+                    "主力推",
+                    "建立時間",
+                ]
+                st.dataframe(display_df[show_cols], use_container_width=True)
+
+            st.markdown("### 🔍 從列表選擇主力推")
+            if not filtered.empty:
+                record_choices = [
+                    f"{row['紀錄ID']} | {row['客隊']} @ {row['主隊']} | {row['開賽時間']}"
+                    for _, row in filtered.iterrows()
+                ]
+                selected = st.selectbox("選擇一筆預測作為主力推", record_choices)
+                if selected:
+                    rec_id = int(selected.split('|')[0].strip())
+                    if st.button("設定為主力推"):
+                        set_main_pick(current_user, rec_id)
+                        st.success("已更新主力推！")
+                        st.rerun()
+
+# ===================== 我的勝率 =====================
+
+elif active_page == "我的勝率":
+    st.header("📈 我的勝率")
+    if not current_user:
+        st.warning("請先登入後再查看。")
+    else:
+        st.subheader("總成績（全部已結算比賽）")
+        df_my = get_leaderboard(" AND player=?", (current_user,), use_spread=False)
+        if df_my.empty:
+            st.info("尚無已結算的勝負盤資料。")
+        else:
+            row = df_my.iloc[0]
+            st.write(
+                f"總場次：{int(row['total_games'])}，命中：{int(row['win_games'])}，"
+                f"勝率：{row['win_rate']}%，平均信心：{row['avg_conf']:.2f}⭐"
+            )
+
+        week_start = get_week_start_today()
+        month_start = get_month_start_today()
+
+        st.subheader("本週表現")
+        df_week = get_leaderboard(
+            " AND player=? AND created_at >= ?",
+            (current_user, week_start),
+            use_spread=False,
+        )
+        if df_week.empty:
+            st.info("本週尚無已結算比賽。")
+        else:
+            row = df_week.iloc[0]
+            st.write(
+                f"本週場次：{int(row['total_games'])}，命中：{int(row['win_games'])}，勝率：{row['win_rate']}%。"
+            )
+
+        st.subheader("本月表現")
+        df_month = get_leaderboard(
+            " AND player=? AND created_at >= ?",
+            (current_user, month_start),
+            use_spread=False,
+        )
+        if df_month.empty:
+            st.info("本月尚無已結算比賽。")
+        else:
+            row = df_month.iloc[0]
+            st.write(
+                f"本月場次：{int(row['total_games'])}，命中：{int(row['win_games'])}，勝率：{row['win_rate']}%。"
+            )
+
+# ===================== 管理員後台 =====================
+
+elif active_page == "管理員後台":
+    st.header("👑 管理員後台")
+    if not is_admin:
+        st.warning("此區僅限管理員登入使用。")
+    else:
+        st.subheader("使用者清單 & 封鎖管理")
+        users_df = get_all_users()
+        if not users_df.empty:
+            users_show = users_df.rename(
+                columns={
+                    "id": "ID",
+                    "username": "玩家帳號",
+                    "is_admin": "是否管理員",
+                    "is_blocked": "是否封鎖",
+                    "points": "點數",
+                }
+            )
+            st.dataframe(users_show, use_container_width=True)
+
+            st.markdown("### 封鎖 / 解除封鎖 玩家")
+            normal_users = users_df[users_df["is_admin"] == 0]
+            if normal_users.empty:
+                st.info("目前沒有一般玩家帳號可封鎖。")
+            else:
+                target_user = st.selectbox(
+                    "選擇玩家帳號",
+                    normal_users["username"].tolist(),
+                )
+                target_blocked = bool(
+                    normal_users[normal_users["username"] == target_user]["is_blocked"].iloc[0]
+                )
+                if target_blocked:
+                    if st.button("解除封鎖"):
+                        update_user_block(target_user, False)
+                        st.success(f"已解除封鎖：{target_user}")
+                        st.rerun()
+                else:
+                    if st.button("封鎖此玩家"):
+                        update_user_block(target_user, True)
+                        st.success(f"已封鎖：{target_user}")
+                        st.rerun()
+        else:
+            st.info("目前尚無使用者資料。")
+
+        # --- 管理員手動調整點數 ---
+        st.markdown("---")
+        st.markdown("### 💰 手動補充 / 扣除玩家點數")
+        if not users_df.empty:
+            target_user2 = st.selectbox(
+                "選擇玩家帳號（調整點數用）",
+                users_df["username"].tolist(),
+                key="points_adjust_user",
+            )
+            delta = st.number_input("調整點數（正數=補點，負數=扣點）", value=10, step=10)
+            reason = st.text_input("備註原因（可選填，例如活動獎勵、補償等）")
+
+            if st.button("執行點數調整"):
+                update_user_points(target_user2, delta)
+                log_reason = reason if reason else "管理員手動調整點數"
+                log_points_change(target_user2, delta, log_reason)
+                st.success(f"已為 {target_user2} 調整點數 {delta} 點。" + (f" 備註：{reason}" if reason else ""))
+                st.rerun()
+
+        # -------- 排行榜區 --------
+        st.markdown("---")
+        st.subheader("🏆 排行榜")
+
+        tab1, tab2, tab3, tab4 = st.tabs(
+            ["總勝率排行榜", "本週勝率", "本月勝率", "玩家點數排行榜"]
+        )
+
+        with tab1:
+            st.write("全部已結算比賽的勝負盤表現（至少一場）。")
+            lb_all = get_leaderboard()
+            if lb_all.empty:
+                st.info("尚無已結算的資料。")
+            else:
+                lb_show = lb_all.rename(
+                    columns={
+                        "player": "玩家",
+                        "total_games": "總場次",
+                        "win_games": "命中場次",
+                        "win_rate": "勝率%",
+                        "avg_conf": "平均信心",
+                    }
+                )
+                st.dataframe(lb_show, use_container_width=True)
+
+        with tab2:
+            st.write("本週（從本週一開始）勝率排行榜。")
+            week_start = get_week_start_today()
+            lb_week = get_leaderboard(
+                " AND created_at >= ?",
+                (week_start,),
+                use_spread=False,
+            )
+            if lb_week.empty:
+                st.info("本週尚無已結算的資料。")
+            else:
+                lb_show = lb_week.rename(
+                    columns={
+                        "player": "玩家",
+                        "total_games": "本週場次",
+                        "win_games": "命中場次",
+                        "win_rate": "勝率%",
+                        "avg_conf": "平均信心",
+                    }
+                )
+                st.dataframe(lb_show, use_container_width=True)
+
+        with tab3:
+            st.write("本月（從本月 1 號開始）勝率排行榜。")
+            month_start = get_month_start_today()
+            lb_month = get_leaderboard(
+                " AND created_at >= ?",
+                (month_start,),
+                use_spread=False,
+            )
+            if lb_month.empty:
+                st.info("本月尚無已結算的資料。")
+            else:
+                lb_show = lb_month.rename(
+                    columns={
+                        "player": "玩家",
+                        "total_games": "本月場次",
+                        "win_games": "命中場次",
+                        "win_rate": "勝率%",
+                        "avg_conf": "平均信心",
+                    }
+                )
+                st.dataframe(lb_show, use_container_width=True)
+
+        with tab4:
+            st.write("依點數由高到低顯示目前最有錢的玩家。")
+            if users_df.empty:
+                st.info("目前尚無使用者資料。")
+            else:
+                pts_df = users_df.sort_values("points", ascending=False).rename(
+                    columns={
+                        "username": "玩家",
+                        "points": "點數",
+                        "is_blocked": "是否封鎖",
+                        "is_admin": "是否管理員",
+                    }
+                )
+                st.dataframe(
+                    pts_df[["玩家", "點數", "是否管理員", "是否封鎖"]],
+                    use_container_width=True,
+                )
+
+        # -------- 全部預測紀錄 --------
+        st.markdown("---")
+        st.subheader("📋 全部預測紀錄（可篩選）")
+        preds_df = get_all_predictions_join()
+        if preds_df.empty:
+            st.info("目前尚無任何預測紀錄。")
+        else:
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                players = ["全部"] + sorted(preds_df["player"].unique().tolist())
+                sel_player = st.selectbox("玩家", players)
+            with col_b:
+                game_ids = ["全部"] + sorted(preds_df["game_id"].unique().tolist())
+                sel_game = st.selectbox("比賽編號 game_id", game_ids)
+            with col_c:
+                date_min = preds_df["created_at"].min()[:10]
+                date_max = preds_df["created_at"].max()[:10]
+                date_filter = st.date_input(
+                    "起訖日期（依 created_at）",
+                    value=(datetime.fromisoformat(date_min), datetime.fromisoformat(date_max)),
+                )
+
+            filtered = preds_df.copy()
+            if sel_player != "全部":
+                filtered = filtered[filtered["player"] == sel_player]
+            if sel_game != "全部":
+                filtered = filtered[filtered["game_id"] == sel_game]
+            if isinstance(date_filter, tuple) and len(date_filter) == 2:
+                start_d, end_d = date_filter
+                filtered = filtered[
+                    (filtered["created_at"] >= start_d.strftime("%Y-%m-%d"))
+                    & (filtered["created_at"] <= end_d.strftime("%Y-%m-%d") + "T23:59:59")
+                ]
+
+            filtered["away_zh"] = filtered["away_team"].map(
+                lambda x: TEAM_NAME_ZH.get(x, x)
+            )
+            filtered["home_zh"] = filtered["home_team"].map(
+                lambda x: TEAM_NAME_ZH.get(x, x)
+            )
+
+            filtered = filtered.rename(
+                columns={
+                    "id": "紀錄ID",
+                    "player": "玩家",
+                    "game_id": "比賽編號",
+                    "game_datetime": "開賽時間",
+                    "pick": "勝負預測",
+                    "spread_pick": "讓分預測",
+                    "confidence": "信心星數",
+                    "is_correct": "勝負命中",
+                    "spread_result": "讓分命中",
+                    "is_main": "主力推",
+                    "created_at": "建立時間",
+                }
+            )
+
+            show_cols = [
+                "紀錄ID",
+                "玩家",
+                "比賽編號",
+                "away_zh",
+                "home_zh",
+                "開賽時間",
+                "勝負預測",
+                "讓分預測",
+                "信心星數",
+                "勝負命中",
+                "讓分命中",
+                "主力推",
+                "建立時間",
+            ]
+            st.dataframe(filtered[show_cols], use_container_width=True)
+
+        # -------- 點數異動紀錄 --------
+        st.markdown("---")
+        st.subheader("📜 點數異動紀錄（最近 100 筆）")
+        conn = get_db()
+        logs_df = pd.read_sql_query(
+            """
+            SELECT username, delta, reason, created_at
+            FROM points_logs
+            ORDER BY created_at DESC
+            LIMIT 100
+            """,
+            conn,
+        )
+        conn.close()
+        if logs_df.empty:
+            st.info("目前尚無點數異動紀錄。")
+        else:
+            logs_df = logs_df.rename(
+                columns={
+                    "username": "玩家",
+                    "delta": "變動點數",
+                    "reason": "原因",
+                    "created_at": "時間",
+                }
+            )
+            st.dataframe(logs_df, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("📤 匯出所有預測為 CSV")
+        if st.button("匯出 predictions_export.csv"):
+            path = export_predictions_to_csv()
+            st.success(f"已匯出到 {path}")
