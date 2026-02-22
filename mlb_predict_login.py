@@ -91,7 +91,9 @@ def fetch_schedule_by_date_tw(target_date: date):
                     "away_name": away_team,
                     "home_name": home_team,
                     "game_date": target_date_str,
-                    "game_datetime": game_dt_tw.strftime("%Y-%m-%d %H:%M"),
+                    # 注意：這裡先保留「原始 UTC 字串」，方便之後比時間＆寫 DB
+                    "game_datetime_utc": game["gameDate"],
+                    "game_datetime_tw": game_dt_tw.strftime("%Y-%m-%d %H:%M"),
                     "venue": venue,
                     "ml_away": 0,
                     "ml_home": 0,
@@ -100,14 +102,44 @@ def fetch_schedule_by_date_tw(target_date: date):
             )
     return games_data
 
-@st.cache_data(ttl=300)
+
 def get_games(target_date: date):
-    """抓指定台灣日期的 MLB 賽程"""
+    """
+    目前先只抓 statsapi，不在這裡寫 DB，避免 database is locked。
+    之後我們再做一個「管理員同步賽程到 DB」的工具，分開處理。
+    """
     try:
-        return fetch_schedule_by_date_tw(target_date)
+        games = fetch_schedule_by_date_tw(target_date)
+        # 為了跟你前面使用欄位相容，補一個 game_datetime 欄位給前端顯示
+        for g in games:
+            g["game_datetime"] = g["game_datetime_utc"]  # 或用 g["game_datetime_tw"]
+        return games
     except Exception as e:
         st.warning(f"抓取 MLB 賽程失敗：{e}")
         return []
+
+    # 同步寫入 DB 的 games 表           ← 從這裡以下全部刪掉
+    with get_db() as conn:
+        cur = conn.cursor()
+        for g in games:
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO games
+                    (game_id, away_team, home_team, game_date, game_datetime, venue)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    g["game_id"],
+                    g["away_name"],
+                    g["home_name"],
+                    g["game_date"],
+                    g["game_datetime"],
+                    g["venue"],
+                ),
+            )
+        conn.commit()
+
+    return games
 
 # ========================================================
 
@@ -141,6 +173,70 @@ def fetch_game_final_score_from_statsapi(game_id: str):
 
     return away_score, home_score, status_str
 
+def set_game_result(game_id: str, winner_pick: str, spread_winner: str = "push"):
+    """
+    結算某一場比賽的所有預測：
+    - 更新 predictions.is_correct / spread_result
+    - 幫命中的玩家發點數
+    - 寫入 points_logs
+    winner_pick: "home" 或 "away"
+    spread_winner: 目前先預設 "push"，之後要做讓分再擴充
+    """
+    # 1. 撈出這場比賽所有預測
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT id, player, pick, spread_pick, confidence, is_main
+            FROM predictions
+            WHERE game_id = ?
+            """,
+            (game_id,),
+        )
+        rows = c.fetchall()
+
+    if not rows:
+        return
+
+    # 2. 逐筆判斷勝負，整理要更新的結果與點數變化
+    updates = []         # (is_correct, spread_result, id)
+    points_changes = []  # (username, delta, reason)
+
+    for pred_id, player, pick, spread_pick, confidence, is_main in rows:
+        # 勝負命中與否
+        is_correct = 1 if pick == winner_pick else 0
+
+        # 讓分目前先全部視為 push（之後你要算盤口再補）
+        spread_result = "push"
+
+        updates.append((is_correct, spread_result, pred_id))
+
+        # 命中才發點數：
+        # 你原本先扣 20 點，所以這裡可以一次補回 40（退 20 + 獎勵 20）
+        if is_correct == 1:
+            base_reward = 40
+            reward = base_reward  # 之後可以依 is_main 再加成
+
+            reason = f"比賽 {game_id} 命中勝負盤，獎勵 {reward} 點"
+            points_changes.append((player, reward, reason))
+
+    # 3. 寫回 predictions 狀態
+    with get_db() as conn:
+        c = conn.cursor()
+        c.executemany(
+            """
+            UPDATE predictions
+            SET is_correct = ?, spread_result = ?
+            WHERE id = ?
+            """,
+            updates,
+        )
+        conn.commit()
+
+    # 4. 依 points_changes 幫玩家加點 + 寫 points_logs
+    for username, delta, reason in points_changes:
+        update_user_points(username, delta)
+        log_points_change(username, delta, reason)
 
 # ===================== The Odds API =====================
 
@@ -214,40 +310,39 @@ def fetch_mlb_odds():
     return odds_map
     
 def resync_games_table():
-    """
-    重新同步 games 表：
-    1. 清空既有 games。
-    2. 用 get_games() 抓一批賽程寫入 games。
-    不動 users / predictions。
-    """
-    conn = get_db()
-    c = conn.cursor()
+    """清空 games 表，並用『今天台灣日期』重新抓一次賽程寫回去。"""
+    # 1. 先清空 games 表
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM games")
+        conn.commit()
 
-    # 清空舊 games 資料
-    c.execute("DELETE FROM games")
-    conn.commit()
+    # 2. 算出今天的台灣日期
+    tz_tw = timezone(timedelta(hours=8))
+    today_tw = datetime.now(tz_tw).date()
 
-    # 用目前的 get_games() 抓賽程重建
-    games = get_games()
-    for g in games:
-        c.execute(
-            """
-            INSERT OR IGNORE INTO games
-            (game_id, away_team, home_team, game_date, game_datetime, venue, ml_away, ml_home, runline, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Scheduled')
-            """,
-            (
-                g["game_id"],
-                g["away_name"],
-                g["home_name"],
-                g["game_date"],
-                g["game_datetime"],
-                g["venue"],
-                g["ml_away"],
-                g["ml_home"],
-                g["runline"],
-            ),
-        )
+    # 3. 用今天日期呼叫 get_games（注意：get_games 需要 target_date 參數）
+    games = get_games(today_tw)
+
+    # 4. 把剛抓到的賽程寫回 games 表
+    with get_db() as conn:
+        c = conn.cursor()
+        for g in games:
+            c.execute(
+                """
+                INSERT OR REPLACE INTO games
+                    (game_id, away_team, home_team, game_date, game_datetime, venue)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    g["game_id"],
+                    g["away_name"],
+                    g["home_name"],
+                    g["game_date"],
+                    g.get("game_datetime") or g.get("game_datetime_utc") or "",
+                    g["venue"],
+                ),
+            )
     conn.commit()
     conn.close()
 
@@ -512,15 +607,16 @@ def apply_daily_bonus_if_needed(username):
     return not already_bonus
 
 def save_prediction(game_id, player, pick, spread_pick, confidence):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        """
-        INSERT INTO predictions (game_id, player, pick, spread_pick, confidence, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (game_id, player, pick, spread_pick, confidence, datetime.now().isoformat()),
-    )
+    """寫入 / 更新一筆預測紀錄（避免長時間佔用 DB 鎖）"""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT INTO predictions (game_id, player, pick, spread_pick, confidence, created_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            """,
+            (game_id, player, pick, spread_pick, confidence),
+        )
     conn.commit()
     conn.close()
 
@@ -970,18 +1066,57 @@ if active_page == "明日賽程":
 
         st.subheader("快速進入預測中心")
         cols = st.columns(len(games))
+
+        # 目前時間（台灣）
+        tz_tw = timezone(timedelta(hours=8))
+        now_tw = datetime.now(tz=tz_tw)
+
         for i, g in enumerate(games):
             with cols[i]:
                 away_zh = TEAM_NAME_ZH.get(g["away_name"], g["away_name"])
                 home_zh = TEAM_NAME_ZH.get(g["home_name"], g["home_name"])
+
                 st.markdown(
                     f"**{away_zh} (客隊)**<br><small>@ {home_zh} (主隊)</small>",
                     unsafe_allow_html=True,
                 )
-                if st.button("預測這場", key=f"goto_{g['game_id']}"):
-                    st.session_state.selected_game = g
-                    st.session_state["active_page"] = "預測中心"
-                    st.rerun()
+
+                # 將 UTC 開賽時間轉成台灣時間
+                try:
+                    game_dt_utc = datetime.fromisoformat(g["game_datetime"].replace("Z", "+00:00"))
+                    game_dt_tw = game_dt_utc.astimezone(tz_tw)
+                except Exception:
+                    game_dt_tw = None
+
+                # 判斷是否允許預測：只看時間
+                can_predict = False
+                reason_msg = ""
+
+                if game_dt_tw is None:
+                    can_predict = False
+                    reason_msg = "本場開賽時間異常，暫不開放預測。"
+                else:
+                    if now_tw < game_dt_tw:
+                        can_predict = True
+                    else:
+                        can_predict = False
+                        reason_msg = "此場已開打或已結束，不能再預測。"
+
+                # 顯示開賽時間（台灣）
+                if game_dt_tw is not None:
+                    st.caption(f"開賽時間（台灣）：{game_dt_tw.strftime('%Y-%m-%d %H:%M')}")
+                else:
+                    st.caption(f"開賽時間：{g['game_datetime']}")
+
+                if can_predict:
+                    if st.button("預測這場", key=f"goto_{g['game_id']}"):
+                        st.session_state.selected_game = g
+                        st.session_state["active_page"] = "預測中心"
+                        st.rerun()
+                else:
+                    st.button("預測已關閉", key=f"goto_{g['game_id']}", disabled=True)
+                    if reason_msg:
+                        st.caption(reason_msg)
 
 # ===================== 預測中心（純預測 + 每日加成） =====================
 
@@ -1000,11 +1135,38 @@ elif active_page == "預測中心":
         away_zh = TEAM_NAME_ZH.get(away_en, away_en) + " (客隊)"
         home_zh = TEAM_NAME_ZH.get(home_en, home_en) + " (主隊)"
 
+        # ===== 預測中心：時間 / 狀態檢查 =====
+        tz_tw = timezone(timedelta(hours=8))
+        now_tw = datetime.now(tz=tz_tw)
+
+        try:
+            game_dt_utc = datetime.fromisoformat(g["game_datetime"].replace("Z", "+00:00"))
+            game_dt_tw = game_dt_utc.astimezone(tz_tw)
+        except Exception:
+            game_dt_tw = None
+
+            can_predict = False
+        lock_reason = ""
+
+        if game_dt_tw is None:
+            can_predict = False
+            lock_reason = "本場開賽時間異常，暫不開放預測。"
+        else:
+            if now_tw < game_dt_tw:
+                can_predict = True
+            else:
+                can_predict = False
+                lock_reason = "此場已開打或已結束，不能再預測。"
+
         col_main, col_odds = st.columns([2, 1])
 
         with col_main:
             st.markdown(f"### {away_zh} @ {home_zh}")
-            st.caption(f"{g['game_datetime']} • {g['venue']}")
+
+            if game_dt_tw is not None:
+                st.caption(f"{game_dt_tw.strftime('%Y-%m-%d %H:%M')}（台灣時間） • {g['venue']}")
+            else:
+                st.caption(f"{g['game_datetime']} • {g['venue']}")
 
             last = get_player_latest_prediction(g["game_id"], current_user)
             user_points = get_user_points(current_user)
@@ -1033,7 +1195,10 @@ elif active_page == "預測中心":
                 )
 
             if st.button("💾 儲存預測"):
-                if user_points < 20:
+                # 先檢查是否允許預測
+                if not can_predict:
+                    st.error(lock_reason or "本場目前已關閉預測。")
+                elif user_points < 20:
                     st.error("點數不足，無法預測（每次需 20 點）。")
                 else:
                     pick_val = "away" if pick_radio == "客勝" else "home"
@@ -1120,9 +1285,6 @@ elif active_page == "我的預測":
             SELECT 
                 p.id,
                 p.game_id,
-                g.away_team,
-                g.home_team,
-                g.game_datetime,
                 p.pick,
                 p.spread_pick,
                 p.confidence,
@@ -1131,7 +1293,6 @@ elif active_page == "我的預測":
                 p.is_main,
                 p.created_at
             FROM predictions p
-            LEFT JOIN games g ON p.game_id = g.game_id
             WHERE p.player=?
             ORDER BY p.created_at DESC
             """,
@@ -1139,6 +1300,56 @@ elif active_page == "我的預測":
             params=(current_user,),
         )
         conn.close()
+
+        if df.empty:
+            st.info("你目前沒有任何預測紀錄。")
+        else:
+            # ===== 用 statsapi 依 game_id 補上隊名、開賽時間、比分 =====
+            df["away_team"] = None
+            df["home_team"] = None
+            df["game_datetime"] = None
+            df["away_score_val"] = None
+            df["home_score_val"] = None
+
+            import statsapi
+
+            unique_game_ids = df["game_id"].dropna().unique().tolist()
+
+            for gid in unique_game_ids:
+                try:
+                    # 用 schedule 拿隊名與開賽時間
+                    sched = statsapi.schedule(game_id=int(gid))
+                    if sched:
+                        ginfo = sched[0]
+                        away_name = ginfo.get("away_name") or ginfo.get("away_team_name")
+                        home_name = ginfo.get("home_name") or ginfo.get("home_team_name")
+                        game_dt = ginfo.get("game_date") or ginfo.get("game_datetime")
+                    else:
+                        away_name = None
+                        home_name = None
+                        game_dt = None
+
+                    # 用 linescore 拿比分
+                    try:
+                        ls = statsapi.linescore(int(gid))
+                        away_score = ls.get("teams", {}).get("away", {}).get("runs")
+                        home_score = ls.get("teams", {}).get("home", {}).get("runs")
+                    except Exception:
+                        away_score = None
+                        home_score = None
+                except Exception:
+                    away_name = None
+                    home_name = None
+                    game_dt = None
+                    away_score = None
+                    home_score = None
+
+                df.loc[df["game_id"] == gid, "away_team"] = away_name
+                df.loc[df["game_id"] == gid, "home_team"] = home_name
+                df.loc[df["game_id"] == gid, "game_datetime"] = game_dt
+                df.loc[df["game_id"] == gid, "away_score_val"] = away_score
+                df.loc[df["game_id"] == gid, "home_score_val"] = home_score
+
 
         if df.empty:
             st.info("你目前沒有任何預測紀錄。")
@@ -1164,6 +1375,8 @@ elif active_page == "我的預測":
                     "id": "紀錄ID",
                     "game_id": "比賽編號",
                     "game_datetime": "開賽時間",
+                    "away_score_val": "客隊得分",
+                    "home_score_val": "主隊得分",
                     "pick": "勝負預測",
                     "spread_pick": "讓分預測",
                     "confidence": "信心星數",
@@ -1195,7 +1408,7 @@ elif active_page == "我的預測":
                         ⭐ 主力推：{away} @ {home}
                     </div>
                     <div style="font-size: 14px;">
-                        開賽時間：{dt}　｜　勝負：{pick}　讓分：{spread}　信心：{conf}⭐
+                        開賽時間：{dt}　｜　比分：{away_score}-{home_score}　｜　勝負：{pick}　讓分：{spread}　信心：{conf}⭐
                     </div>
                     <div style="font-size: 12px; margin-top: 4px;">
                         建立時間：{created}
@@ -1205,6 +1418,8 @@ elif active_page == "我的預測":
                     away=m["客隊"],
                     home=m["主隊"],
                     dt=m["開賽時間"],
+                    away_score=("" if pd.isna(m["客隊得分"]) else int(m["客隊得分"])),
+                    home_score=("" if pd.isna(m["主隊得分"]) else int(m["主隊得分"])),
                     pick=m["勝負預測"],
                     spread=m["讓分預測"],
                     conf=m["信心星數"],
@@ -1223,6 +1438,8 @@ elif active_page == "我的預測":
                     "客隊",
                     "主隊",
                     "開賽時間",
+                    "客隊得分",
+                    "主隊得分",
                     "勝負預測",
                     "讓分預測",
                     "信心星數",
@@ -1231,6 +1448,7 @@ elif active_page == "我的預測":
                     "主力推",
                     "建立時間",
                 ]
+
                 st.dataframe(display_df[show_cols], use_container_width=True)
 
             st.markdown("### 🔍 從列表選擇主力推")
