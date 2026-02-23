@@ -6,6 +6,7 @@ import os
 import requests
 
 
+
 st.write("這是 MLB_PREDICT Login 版 測試畫面 v4.4（點數紀錄+每日獎勵+補點）")
 
 DB_PATH = "mlb_predictions.db"
@@ -770,53 +771,54 @@ def get_all_predictions_join():
     )
     conn.close()
     return df
-    
-def get_distinct_game_ids_in_predictions():
-    """從 predictions 取得目前有預測紀錄的 game_id 列表"""
-    conn = get_db()
-    df = pd.read_sql_query(
-        """
-        SELECT DISTINCT game_id
-        FROM predictions
-        WHERE game_id IS NOT NULL
-        """,
-        conn,
-    )
-    conn.close()
-    return df["game_id"].tolist()
-    
-def get_game_ids_by_date(game_date_str: str):
+
+def get_all_predicted_game_ids():
     """
-    從 games 表根據 game_date 取得當日所有有預測紀錄的 game_id。
-    game_date_str 例：'2026-02-22'
+    從 predictions 抓出所有曾經被預測過的 game_id（去重），
+    依照 game_id 排序，回傳 list[str]。
     """
     with get_db() as conn:
         c = conn.cursor()
-        # 先從 predictions 找出所有有預測的 game_id
         c.execute(
             """
             SELECT DISTINCT game_id
             FROM predictions
+            WHERE game_id IS NOT NULL
+            ORDER BY game_id
             """
         )
-        used_ids = [row[0] for row in c.fetchall()]
+        rows = c.fetchall()
+    return [row[0] for row in rows]
 
-    if not used_ids:
-        return []
+def get_game_ids_by_date_from_created_at(target_date_str: str):
+    """
+    從 predictions.created_at 判斷「指定日期（台灣時間）」有哪些 game_id 有預測。
+    target_date_str 例：'2026-02-22'
+    """
+    tz_tw = timezone(timedelta(hours=8))
 
-    # 再從 games 依照 game_date 篩出這一天的比賽
+    # 把字串轉成日期（台灣日曆）
+    target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+
+    # 當天台灣時間 00:00 ~ 23:59:59
+    start_dt_tw = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=tz_tw)
+    end_dt_tw = datetime.combine(target_date, datetime.max.time()).replace(tzinfo=tz_tw)
+
+    # 你的 created_at 是 TEXT，例如 '2026-02-22 13:45:00'，目前先當成「台灣時間字串」來比
+    start_str = start_dt_tw.strftime("%Y-%m-%d %H:%M:%S")
+    end_str = end_dt_tw.strftime("%Y-%m-%d %H:%M:%S")
+
     with get_db() as conn:
-        placeholders = ",".join(["?"] * len(used_ids))
-        params = [game_date_str] + used_ids
         c = conn.cursor()
         c.execute(
-            f"""
-            SELECT game_id
-            FROM games
-            WHERE game_date = ?
-              AND game_id IN ({placeholders})
+            """
+            SELECT DISTINCT game_id
+            FROM predictions
+            WHERE created_at BETWEEN ? AND ?
+              AND game_id IS NOT NULL
+            ORDER BY game_id
             """,
-            params,
+            (start_str, end_str),
         )
         rows = c.fetchall()
 
@@ -1805,130 +1807,120 @@ elif active_page == "管理員後台":
                 )
                 st.dataframe(pts_df[["玩家", "點數", "是否封鎖", "是否管理員"]], use_container_width=True)
 
-        # -------- 單場比賽自動結算 --------
-        st.markdown("---")
-        st.subheader("⚙ 單場比賽自動結算（statsapi）")
+    # ===================== 單場比賽自動結算 =====================
+    with st.expander("⚙ 單場比賽自動結算", expanded=False):
+        # 從 predictions 抓出所有有預測紀錄的 game_id
+        game_ids = get_all_predicted_game_ids()
 
-        # 從 predictions 取得目前有預測紀錄的 game_id
-        used_game_ids = get_distinct_game_ids_in_predictions()
-        if not used_game_ids:
-            st.info("目前沒有任何預測紀錄，無需結算。")
+        if not game_ids:
+            st.info("目前尚無任何有預測紀錄的比賽。")
         else:
-            # 從 games 表抓出這些 game_id 的實際賽程資訊
-            conn_games = get_db()
-            games_df = pd.read_sql_query(
-                """
-                SELECT game_id, away_team, home_team, game_datetime
-                FROM games
-                WHERE game_id IN ({})
-                ORDER BY game_datetime
-                """.format(",".join(["?"] * len(used_game_ids))),
-                conn_games,
-                params=used_game_ids,
+            # 做一個 map：game_id -> 顯示文字（包含當前狀態＆比分）
+            options = []
+            label_dict = {}
+
+            for gid in game_ids:
+                try:
+                    # 用你原本的工具抓比分＆狀態
+                    away_score, home_score, status_str = fetch_game_final_score_from_statsapi(str(gid))
+                    if away_score is not None and home_score is not None:
+                        label = f"{gid} - 比分 {away_score} : {home_score}（{status_str}）"
+                    else:
+                        label = f"{gid} - 尚無完整比分（{status_str}）"
+                except Exception as e:
+                    label = f"{gid} - 取得比分失敗：{e}"
+
+                options.append(gid)
+                label_dict[gid] = label
+
+            selected_gid = st.selectbox(
+                "選擇要自動結算的比賽（只列出曾經有被預測過的 game_id）",
+                options=options,
+                format_func=lambda x: label_dict.get(x, str(x)),
             )
-            conn_games.close()
 
-            if games_df.empty:
-                st.warning("games 表中找不到對應的賽程資料，建議先使用上方的『重新同步 games 表』功能。")
-            else:
-                game_choices = [
-                    f"{row['game_id']} | {row['away_team']} @ {row['home_team']} | {row['game_datetime']}"
-                    for _, row in games_df.iterrows()
-                ]
-                selected_game_str = st.selectbox("選擇要自動結算的比賽", game_choices)
+            if st.button("對此單場比賽執行自動結算"):
+                if selected_gid is None:
+                    st.warning("請先選擇一場比賽。")
+                else:
+                    with st.spinner(f"正在自動結算比賽 {selected_gid} ..."):
+                        try:
+                            away_score, home_score, status_str = fetch_game_final_score_from_statsapi(str(selected_gid))
 
-                if selected_game_str:
-                    selected_game_id = selected_game_str.split("|")[0].strip()
-                    st.write(f"已選擇比賽編號：`{selected_game_id}`")
-
-                    # 顯示目前這場在 DB 中的預測概況（所有玩家）
-                    with st.expander("查看此場目前預測紀錄（所有玩家）"):
-                        all_preds_df = get_all_predictions_join()
-                        game_df = all_preds_df[all_preds_df["game_id"] == selected_game_id]
-                        st.dataframe(game_df, use_container_width=True)
-
-                    if st.button("從 statsapi 抓取比分並自動結算這場比賽"):
-                        with st.spinner("從 statsapi 抓取最終比分中，請稍候..."):
-                            away_score, home_score, status_str = fetch_game_final_score_from_statsapi(
-                                selected_game_id
-                            )
-
-                        if away_score is None or home_score is None:
-                            st.error(f"無法取得有效比分（狀態：{status_str}），請確認比賽是否已結束。")
-                        else:
-                            st.success(
-                                f"抓到比分：客隊 {away_score} 分，主隊 {home_score} 分（狀態：{status_str}）。"
-                            )
-
-                            # 決定勝負結果 winner_pick
-                            if away_score > home_score:
-                                winner_pick = "away"
-                            elif home_score > away_score:
-                                winner_pick = "home"
+                            if status_str != "Final":
+                                st.error(f"比賽狀態為「{status_str}」，尚未 Final，無法自動結算。")
+                            elif away_score is None or home_score is None:
+                                st.error("目前無法取得完整比分，請稍後再試。")
                             else:
-                                # 平手的情況先視為無法結算（MLB 正式賽理論上不會以平手結束）
-                                st.error("比分為平手，暫不自動結算，請手動處理。")
-                                winner_pick = None
+                                if away_score > home_score:
+                                    winner_pick = "away"
+                                    spread_winner = "away"
+                                elif home_score > away_score:
+                                    winner_pick = "home"
+                                    spread_winner = "home"
+                                else:
+                                    winner_pick = "push"
+                                    spread_winner = "push"
 
-                            # 目前先不自動判斷讓分結果，直接給 "push"
-                            spread_winner = "push"
+                                set_game_result(str(selected_gid), winner_pick, spread_winner)
+                                st.success(
+                                    f"比賽 {selected_gid} 已根據比分 {away_score} : {home_score} 完成自動結算。"
+                                )
+                        except Exception as e:
+                            st.error(f"自動結算過程發生錯誤：{e}")
 
-                            if winner_pick is not None:
-                                # 呼叫原本結算函式
-                                set_game_result(selected_game_id, winner_pick, spread_winner)
-                                st.success("已依據 statsapi 比分完成此場比賽的自動結算。")
                                 
-        # -------- 指定日期一鍵自動結算 --------
-        st.markdown("---")
-        st.subheader("📅 指定日期一鍵自動結算")
+    # ===================== 指定日期一鍵自動結算 =====================
+    with st.expander("📅 指定日期一鍵自動結算（依玩家預測時間）", expanded=False):
+        st.write("說明：依照 predictions.created_at（台灣時間）判斷當天有哪些比賽被預測過，並對已 Final 的比賽執行自動結算。")
 
-        tz_tw = timezone(timedelta(hours=8))
-        today_tw = datetime.now(tz_tw).date()
-        target_date = st.date_input("選擇要一鍵結算的日期（依 games.game_date）", value=today_tw, key="settle_date")
+        target_date = st.date_input("選擇要一鍵結算的日期（台灣時間）")
 
-        if st.button("一鍵結算該日所有已結束比賽"):
-            game_date_str = target_date.strftime("%Y-%m-%d")
-            target_game_ids = get_game_ids_by_date(game_date_str)
+        if st.button("一鍵結算該日期所有已結束比賽"):
+            date_str = target_date.strftime("%Y-%m-%d")
+            game_ids_for_day = get_game_ids_by_date_from_created_at(date_str)
 
-            if not target_game_ids:
-                st.info(f"{game_date_str} 這一天沒有任何預測紀錄需要結算。")
+            if not game_ids_for_day:
+                st.info(f"{date_str} 這一天沒有任何玩家預測紀錄。")
             else:
-                st.write(f"{game_date_str} 共有 {len(target_game_ids)} 場有預測的比賽，開始自動結算…")
-
-                import statsapi
+                st.write(f"{date_str} 共有 {len(game_ids_for_day)} 場「曾被預測」的比賽，開始自動檢查並結算 Final 場次...")
 
                 settled = []
                 skipped = []
 
-                for gid in target_game_ids:
-                    # 1. 用 statsapi 抓比分
-                    away_score, home_score, status_str = fetch_game_final_score_from_statsapi(str(gid))
+                for gid in game_ids_for_day:
+                    try:
+                        away_score, home_score, status_str = fetch_game_final_score_from_statsapi(str(gid))
 
-                    if away_score is None or home_score is None:
-                        skipped.append((gid, status_str))
-                        continue
+                        if status_str != "Final":
+                            skipped.append((gid, status_str))
+                            continue
+                        if away_score is None or home_score is None:
+                            skipped.append((gid, f"{status_str} / 無比分"))
+                            continue
 
-                    # 2. 判斷勝負
-                    if away_score > home_score:
-                        winner_pick = "away"
-                    elif home_score > away_score:
-                        winner_pick = "home"
-                    else:
-                        # 平手就先跳過
-                        skipped.append((gid, f"{status_str} / tie"))
-                        continue
+                        if away_score > home_score:
+                            winner_pick = "away"
+                            spread_winner = "away"
+                        elif home_score > away_score:
+                            winner_pick = "home"
+                            spread_winner = "home"
+                        else:
+                            winner_pick = "push"
+                            spread_winner = "push"
 
-                    # 3. 呼叫既有結算函式
-                    set_game_result(str(gid), winner_pick, "push")
-                    settled.append((gid, away_score, home_score, status_str))
+                        set_game_result(str(gid), winner_pick, spread_winner)
+                        settled.append((gid, away_score, home_score, status_str))
+                    except Exception as e:
+                        skipped.append((gid, f"發生錯誤：{e}"))
 
                 if settled:
-                    st.success(f"已結算 {len(settled)} 場比賽：")
+                    st.success(f"已自動結算 {len(settled)} 場比賽：")
                     for gid, a, h, st_str in settled:
                         st.write(f"- 比賽 {gid}：客 {a} 分，主 {h} 分（{st_str}）")
 
                 if skipped:
-                    st.warning("以下比賽未自動結算（比分未知或平手）：")
+                    st.warning("以下比賽未自動結算（比分未知、尚未 Final 或其他原因）：")
                     for gid, st_str in skipped:
                         st.write(f"- 比賽 {gid}（狀態：{st_str}）")
 
